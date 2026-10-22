@@ -10,7 +10,7 @@
         ↘ 工作记忆 / 长期记忆 / 用户画像                    ↘ Prometheus 指标 + LLM-as-Judge 评测
 ```
 
-技术栈：`Java 21` · `Spring Boot 3.5` · `Spring AI` · `LangChain4j` · `Redis` · `ChromaDB` · `Micrometer / Prometheus` · `Docker Compose` · `Vue 3`
+技术栈：`Java 21` · `Spring Boot 3.5` · `Spring AI` · `LangChain4j` · `Redis` · `ChromaDB / 本地哈希向量` · `Micrometer / Prometheus` · `Docker Compose` · `Vue 3`
 
 ---
 
@@ -39,10 +39,12 @@
 
 ### 2. 知识增强（RAG）
 
-- **按意图触发检索**（RAG gating）：问候、感谢、转人工这类请求不检索，省掉无效调用，也避免无关知识污染上下文。
-- **混合召回**：文档切片后，BM25 关键词分与向量语义分加权融合，兼顾"错误码精确匹配"和"说法不同但意思一样"。
-- **LLM 重排**：只对 Top-K 候选做 LLM rerank，把最该引用的片段排到前面；重排失败自动回退融合分。
-- **工具治理**：查询改写、多子查询并行召回、TTL 缓存、超时、熔断器、fallback、调用统计一层不少，单点失败不影响回复。
+- **按意图触发检索**（RAG gating）：14 个业务意图检索，问候、转人工、反馈、OTHER 这 5 类不检索，省掉无效调用。
+- **混合召回**：`recursive(500, 80)` 切片后，BM25（k1=1.5、b=0.75）与 256 维哈希向量各归一，按 **0.45 / 0.55** 加权融合。
+- **LLM 重排**：候选数多于 topK 时才调 LLM 重排（temp=0），失败自动回退融合分顺序，不阻塞回复。
+- **工具治理**：查询改写（1 原查询 + 3 子查询）、并行召回、TTL 缓存（300s）、熔断（5 次失败 / 60s）、fallback、调用统计。
+- **实现取舍**：向量用的是字符 n-gram 哈希投影，不是 embedding 模型——省掉外部依赖和冷启动成本，
+  代价是语义泛化弱，所以融合里 BM25 占 0.45 兜关键词；Python 版则是真接 ChromaDB，两版对照见 `pudding-python/`。
 
 ### 3. 上下文与记忆
 
@@ -55,8 +57,9 @@
 ### 4. 监控与评测
 
 - **在线指标**：Micrometer + Prometheus 采集 Agent 成功率、延迟、工具调用统计，`GET /metrics` 直接抓取。
-- **动态降权**：成功率或延迟越过阈值时计算 `monitor_penalty` 写回编排器，自动降低问题 Agent 的 `routing_score`，
-  后续流量少分给它 —— 出问题不用改代码，路由会自己躲开。
+- **动态降权**：成功率或延迟越过阈值时计算 `monitor_penalty` 写回编排器，参与
+  `routing_score = (成功率×0.7 + 延迟分×0.3) × (1 − penalty)`，用于同类型多实例的选优；
+  当前每类只挂一个实例，所以它的主要价值是暴露问题 + 告警，跨域流量迁移留作后续改造（见 Roadmap）。
 - **意图评测**：用标注用例算 Accuracy、Macro-F1、逐类 Precision / Recall / F1。
 - **端到端评测**：真实调用编排链路生成回复，再用 LLM-as-Judge 从**相关性、准确性、完整性、有用性**四个维度打分。
 - **回归检测**：结果与 `baseline` 对比，任一指标退化超过阈值即标记 regression 并给出优化建议。
@@ -126,7 +129,8 @@ cd pudding-java
 ./mvnw spring-boot:run     # Windows: mvnw.cmd spring-boot:run
 ```
 
-需要本地有 Redis（`REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`），没有 ChromaDB 时会走本地向量 + JSON 持久化。
+需要本地有 Redis（`REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`）。知识库存 `data/java/knowledge-store.json`，
+检索用本地哈希向量 + BM25，不依赖外部向量库（Chroma 容器保留在 compose 里，Java 侧为可移植性未启用其自动配置）。
 
 ---
 
@@ -235,6 +239,7 @@ curl -X POST http://localhost:8080/eval/run -H 'Content-Type: application/json' 
 
 ## Roadmap
 
+- [ ] 把 `monitor_penalty` 乘进领域打分（`domainScores`），实现跨 Agent 的流量迁移，而不只是同类型多实例选优
 - [ ] 用真实工单数据补充意图标注集，替换内置用例
 - [ ] 检索链路加缓存命中率指标，进一步压低平均延迟
 - [ ] 支持多租户隔离（不同商家的知识库与 Skills 分开）
